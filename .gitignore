@@ -1,0 +1,9 @@
+.lake/
+build/
+*~
+*.swp
+*.o
+*.a
+*.so
+*.dylib
+.DS_Store
