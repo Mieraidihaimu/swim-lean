@@ -7,3 +7,4 @@ build/
 *.so
 *.dylib
 .DS_Store
+c_runtime/swim_node

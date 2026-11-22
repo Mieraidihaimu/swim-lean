@@ -18,32 +18,13 @@
 #include <arpa/inet.h>
 
 #include <lean/lean.h>
-
-/* Forward declarations for Lean 4 runtime and generated modules */
-void lean_initialize_runtime_module(void);
-lean_object* initialize_swim_SwimCore(uint8_t builtin);
+#include "swim_exports.h"
 
 /* Wrapper providing initialize_SwimCore signature */
 lean_object* initialize_SwimCore(uint8_t builtin, lean_object* world) {
     (void)world;
     return initialize_swim_SwimCore(builtin);
 }
-
-/* Lean C ABI declarations exported by SwimCore/Exports.lean */
-lean_object* swim_init_node(uint32_t id, uint32_t ip, uint16_t port, uint64_t seed);
-lean_object* swim_add_peer(lean_object* st, uint32_t id, uint32_t ip, uint16_t port);
-lean_object* swim_step_tick(lean_object* st, uint64_t now);
-lean_object* swim_step_packet(lean_object* st, uint32_t src_ip, uint16_t src_port, lean_object* payload, uint64_t now);
-
-uint8_t  swim_action_is_send(lean_object* act);
-uint32_t swim_action_send_dest_ip(lean_object* act);
-uint16_t swim_action_send_dest_port(lean_object* act);
-lean_object* swim_action_send_payload(lean_object* act);
-
-uint8_t  swim_action_is_membership_change(lean_object* act);
-uint32_t swim_action_membership_node(lean_object* act);
-uint8_t  swim_action_membership_status(lean_object* act);
-uint32_t swim_action_membership_incarnation(lean_object* act);
 
 static volatile sig_atomic_t g_running = 1;
 
