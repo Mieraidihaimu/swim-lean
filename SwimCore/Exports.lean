@@ -38,6 +38,11 @@ def swimStepResultState (res : NodeState × Array Action) : NodeState :=
 def swimStepResultActions (res : NodeState × Array Action) : Array Action :=
   res.2
 
+/-- Return the next monotonic timestamp (ms) at which the node requires a timer tick. -/
+@[export swim_next_wakeup_at]
+def swimNextWakeupAt (st : NodeState) : UInt64 :=
+  nextWakeupAt st
+
 /-- Get the number of actions in an `Array Action`. -/
 @[export swim_actions_size]
 def swimActionsSize (actions : Array Action) : UInt32 :=

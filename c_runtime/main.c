@@ -118,6 +118,7 @@ static lean_object* execute_actions_and_update(int sockfd, lean_object* step_res
 
     size_t num_actions = lean_array_size(actions);
     for (size_t i = 0; i < num_actions; i++) {
+        /* act is borrowed from actions; increment refcount before owned @[export] calls */
         lean_object* act = lean_array_get_core(actions, i);
 
         lean_inc(act);
@@ -345,27 +346,36 @@ int main(int argc, char* argv[]) {
 
     while (g_running) {
         uint64_t now_ms = get_monotonic_time_ms();
+        lean_inc(state);
+        uint64_t wakeup_ms = swim_next_wakeup_at(state);
+        uint64_t due_ms = (wakeup_ms < next_tick_ms) ? wakeup_ms : next_tick_ms;
 
-        /* Process timer tick when deadline reached */
-        if (now_ms >= next_tick_ms) {
+        /* Process timer tick when periodic tick or protocol deadline is reached */
+        if (now_ms >= due_ms) {
+            bool is_periodic = (now_ms >= next_tick_ms);
             state = handle_timer_tick(sockfd, state, now_ms);
-            tick_count++;
-            if (max_ticks > 0 && tick_count >= max_ticks) {
-                printf("[SWIM-C] Reached max ticks (%llu), shutting down...\n",
-                       (unsigned long long)max_ticks);
-                break;
+            if (is_periodic) {
+                tick_count++;
+                if (max_ticks > 0 && tick_count >= max_ticks) {
+                    printf("[SWIM-C] Reached max ticks (%llu), shutting down...\n",
+                           (unsigned long long)max_ticks);
+                    break;
+                }
+                next_tick_ms = now_ms + (uint64_t)tick_interval_ms;
             }
-            next_tick_ms = now_ms + (uint64_t)tick_interval_ms;
+            now_ms = get_monotonic_time_ms();
+            lean_inc(state);
+            wakeup_ms = swim_next_wakeup_at(state);
+            due_ms = (wakeup_ms < next_tick_ms) ? wakeup_ms : next_tick_ms;
         }
 
-        /* Compute poll timeout in milliseconds */
-        now_ms = get_monotonic_time_ms();
+        /* Compute poll timeout in milliseconds using both periodic tick and Lean protocol deadline */
         int timeout_ms = 0;
-        if (next_tick_ms > now_ms) {
-            uint64_t diff = next_tick_ms - now_ms;
+        if (due_ms > now_ms) {
+            uint64_t diff = due_ms - now_ms;
             timeout_ms = (diff > 1000ULL) ? 1000 : (int)diff;
         } else {
-            timeout_ms = 0;
+            timeout_ms = 1;
         }
 
         struct pollfd pfd;

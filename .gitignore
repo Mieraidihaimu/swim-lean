@@ -1,4 +1,5 @@
 .lake/
+SwimMathlib/.lake/
 build/
 *~
 *.swp

@@ -23,9 +23,10 @@ lean_object* swim_add_peer(lean_object* st, uint32_t id, uint32_t ip, uint16_t p
 lean_object* swim_step_tick(lean_object* st, uint64_t now);
 lean_object* swim_step_packet(lean_object* st, uint32_t srcIp, uint16_t srcPort, lean_object* payload, uint64_t now);
 
-/* Step result decomposition helpers (for (NodeState × Array Action)) */
+/* Step result decomposition helpers (borrowed @& arguments) */
 lean_object* swim_step_result_state(lean_object* res);
 lean_object* swim_step_result_actions(lean_object* res);
+uint64_t     swim_next_wakeup_at(lean_object* st);
 
 /* Array Action accessors */
 uint32_t     swim_actions_size(lean_object* actions);

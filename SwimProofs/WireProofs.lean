@@ -498,4 +498,367 @@ theorem roundtrip_pingReq_max_fields :
   unfold decodeGossipUpdates decodeGossipUpdates.loop decodeGossipUpdates.loop
   rfl
 
+/-! ### Universal Quantified Round-Trip Bijection Theorem -/
+
+private theorem byteArray_get!_eq (b : ByteArray) (i : Nat) : b.get! i = b[i]! := by
+  by_cases h : i < b.size
+  · have h1 : b.get! i = b.data[i]! := by cases b; rfl
+    have h2 : b[i]! = b.data[i] := by
+      rw [getElem!_pos b i h]
+      exact ByteArray.getElem_eq_getElem_data
+    have h3 : b.data[i]! = b.data[i] := getElem!_pos b.data i h
+    rw [h1, h2, h3]
+  · have h1 : b.get! i = b.data[i]! := by cases b; rfl
+    have h2 : b[i]! = default := getElem!_neg b i h
+    have h3 : b.data[i]! = default := getElem!_neg b.data i h
+    rw [h1, h2, h3]
+
+private theorem byteArray_get!_push_lt (b : ByteArray) (x : UInt8) (i : Nat) (hi : i < b.size) :
+    (b.push x).get! i = b.get! i := by
+  simp only [byteArray_get!_eq]
+  exact ByteArray.getElem!_push_lt b x i hi
+
+private theorem byteArray_get!_push_eq (b : ByteArray) (x : UInt8) :
+    (b.push x).get! b.size = x := by
+  simp only [byteArray_get!_eq]
+  exact ByteArray.getElem!_push_eq b x
+
+/-- `PrefixOf b1 b2` holds when `b2` extends `b1` without mutating any byte `< b1.size`. -/
+def PrefixOf (b1 b2 : ByteArray) : Prop :=
+  b1.size ≤ b2.size ∧ ∀ i, i < b1.size → b2.get! i = b1.get! i
+
+theorem PrefixOf_refl (b : ByteArray) : PrefixOf b b :=
+  ⟨Nat.le_refl _, fun _ _ => rfl⟩
+
+theorem PrefixOf_trans {a b c : ByteArray} (hab : PrefixOf a b) (hbc : PrefixOf b c) : PrefixOf a c :=
+  ⟨Nat.le_trans hab.1 hbc.1, fun i hi => by
+    rw [hbc.2 i (Nat.lt_of_lt_of_le hi hab.1), hab.2 i hi]⟩
+
+theorem PrefixOf_get! {b1 b2 : ByteArray} (h : PrefixOf b1 b2) {i : Nat} (hi : i < b1.size) :
+    b2.get! i = b1.get! i :=
+  h.2 i hi
+
+theorem PrefixOf_push (b : ByteArray) (x : UInt8) : PrefixOf b (b.push x) :=
+  ⟨by rw [ByteArray.size_push]; omega, fun i hi => byteArray_get!_push_lt b x i hi⟩
+
+theorem PrefixOf_pushUInt32BE (b : ByteArray) (v : UInt32) : PrefixOf b (pushUInt32BE b v) := by
+  unfold pushUInt32BE
+  exact PrefixOf_trans (PrefixOf_push _ _) <|
+        PrefixOf_trans (PrefixOf_push _ _) <|
+        PrefixOf_trans (PrefixOf_push _ _) (PrefixOf_push _ _)
+
+theorem PrefixOf_pushGossipUpdate (b : ByteArray) (u : GossipUpdate) :
+    PrefixOf b (pushGossipUpdate b u) := by
+  unfold pushGossipUpdate
+  exact PrefixOf_trans (PrefixOf_pushUInt32BE _ _) <|
+        PrefixOf_trans (PrefixOf_push _ _) <|
+        PrefixOf_trans (PrefixOf_pushUInt32BE _ _) (PrefixOf_push _ _)
+
+theorem PrefixOf_pushGossipUpdates_loop (updates : Array GossipUpdate) (count i : Nat) (acc : ByteArray) :
+    PrefixOf acc (pushGossipUpdates.loop updates count i acc) := by
+  induction i, acc using pushGossipUpdates.loop.induct updates count with
+  | case1 i acc h u ih =>
+    rw [pushGossipUpdates.loop.eq_def]
+    simp only [h, ↓reduceDIte]
+    exact PrefixOf_trans (PrefixOf_pushGossipUpdate acc _) ih
+  | case2 i acc h =>
+    rw [pushGossipUpdates.loop.eq_def]
+    simp only [h, ↓reduceDIte]
+    exact PrefixOf_refl acc
+
+theorem PrefixOf_pushGossipUpdates (b : ByteArray) (updates : Array GossipUpdate) (count : Nat) :
+    PrefixOf b (pushGossipUpdates b updates count) :=
+  PrefixOf_pushGossipUpdates_loop updates count 0 b
+
+theorem uint32_toUInt8_recombine (v : UInt32) :
+    ((((v >>> 24).toUInt8.toUInt32) <<< 24) |||
+     (((v >>> 16).toUInt8.toUInt32) <<< 16) |||
+     (((v >>> 8).toUInt8.toUInt32) <<< 8) |||
+     (v.toUInt8.toUInt32)) = v := by
+  bv_decide
+
+theorem readUInt32BE_pushUInt32BE (b bytes : ByteArray) (v : UInt32)
+    (hpre : PrefixOf (pushUInt32BE b v) bytes) :
+    readUInt32BE bytes b.size = some v := by
+  have hsz_push : (pushUInt32BE b v).size = b.size + 4 := pushUInt32BE_size b v
+  have hsz : b.size + 4 ≤ bytes.size := by rw [← hsz_push]; exact hpre.1
+  unfold readUInt32BE
+  simp only [hsz, ↓reduceIte]
+  have hb0 : bytes.get! b.size = (v >>> 24).toUInt8 := by
+    rw [hpre.2 b.size (by rw [hsz_push]; omega)]
+    have hp : PrefixOf (b.push (v >>> 24).toUInt8) (pushUInt32BE b v) := by
+      unfold pushUInt32BE
+      exact PrefixOf_trans (PrefixOf_push _ _) <| PrefixOf_trans (PrefixOf_push _ _) (PrefixOf_push _ _)
+    rw [PrefixOf_get! hp (by simp [ByteArray.size_push])]
+    exact byteArray_get!_push_eq b _
+  have hb1 : bytes.get! (b.size + 1) = (v >>> 16).toUInt8 := by
+    rw [hpre.2 (b.size + 1) (by rw [hsz_push]; omega)]
+    have hp : PrefixOf ((b.push (v >>> 24).toUInt8).push (v >>> 16).toUInt8) (pushUInt32BE b v) := by
+      unfold pushUInt32BE
+      exact PrefixOf_trans (PrefixOf_push _ _) (PrefixOf_push _ _)
+    rw [PrefixOf_get! hp (by simp [ByteArray.size_push])]
+    have hlt : b.size + 1 = (b.push (v >>> 24).toUInt8).size := by simp [ByteArray.size_push]
+    rw [hlt]
+    exact byteArray_get!_push_eq _ _
+  have hb2 : bytes.get! (b.size + 2) = (v >>> 8).toUInt8 := by
+    rw [hpre.2 (b.size + 2) (by rw [hsz_push]; omega)]
+    have hp : PrefixOf (((b.push (v >>> 24).toUInt8).push (v >>> 16).toUInt8).push (v >>> 8).toUInt8) (pushUInt32BE b v) := by
+      unfold pushUInt32BE
+      exact PrefixOf_push _ _
+    rw [PrefixOf_get! hp (by simp [ByteArray.size_push])]
+    have hlt : b.size + 2 = ((b.push (v >>> 24).toUInt8).push (v >>> 16).toUInt8).size := by
+      simp [ByteArray.size_push]
+    rw [hlt]
+    exact byteArray_get!_push_eq _ _
+  have hb3 : bytes.get! (b.size + 3) = v.toUInt8 := by
+    rw [hpre.2 (b.size + 3) (by rw [hsz_push]; omega)]
+    unfold pushUInt32BE
+    have hlt : b.size + 3 = (((b.push (v >>> 24).toUInt8).push (v >>> 16).toUInt8).push (v >>> 8).toUInt8).size := by
+      simp [ByteArray.size_push]
+    rw [hlt]
+    exact byteArray_get!_push_eq _ _
+  rw [hb0, hb1, hb2, hb3]
+  exact congrArg some (uint32_toUInt8_recombine v)
+
+theorem readGossipUpdate_pushGossipUpdate (b bytes : ByteArray) (u : GossipUpdate)
+    (hpre : PrefixOf (pushGossipUpdate b u) bytes) :
+    readGossipUpdate bytes b.size = some (u, b.size + 10) := by
+  have hsz_push : (pushGossipUpdate b u).size = b.size + 10 := pushGossipUpdate_size b u
+  have hsz : b.size + 10 ≤ bytes.size := by rw [← hsz_push]; exact hpre.1
+  unfold readGossipUpdate
+  simp only [hsz, ↓reduceIte]
+  have hid : readUInt32BE bytes b.size = some u.id := by
+    apply readUInt32BE_pushUInt32BE b bytes u.id
+    have h1 : PrefixOf (pushUInt32BE b u.id) (pushGossipUpdate b u) := by
+      unfold pushGossipUpdate
+      exact PrefixOf_trans (PrefixOf_push _ _) <|
+            PrefixOf_trans (PrefixOf_pushUInt32BE _ _) (PrefixOf_push _ _)
+    exact PrefixOf_trans h1 hpre
+  have hst : bytes.get! (b.size + 4) = encodeMemberStatus u.status := by
+    rw [hpre.2 (b.size + 4) (by rw [hsz_push]; omega)]
+    have hp : PrefixOf ((pushUInt32BE b u.id).push (encodeMemberStatus u.status)) (pushGossipUpdate b u) := by
+      unfold pushGossipUpdate
+      exact PrefixOf_trans (PrefixOf_pushUInt32BE _ _) (PrefixOf_push _ _)
+    rw [PrefixOf_get! hp (by simp [ByteArray.size_push, pushUInt32BE_size])]
+    have hlt : b.size + 4 = (pushUInt32BE b u.id).size := (pushUInt32BE_size b u.id).symm
+    rw [hlt]
+    exact byteArray_get!_push_eq _ _
+  have hinc : readUInt32BE bytes (b.size + 5) = some u.incarnation := by
+    have hpos : b.size + 5 = ((pushUInt32BE b u.id).push (encodeMemberStatus u.status)).size := by
+      simp [ByteArray.size_push, pushUInt32BE_size]
+    rw [hpos]
+    apply readUInt32BE_pushUInt32BE _ bytes u.incarnation
+    have h1 : PrefixOf (pushUInt32BE ((pushUInt32BE b u.id).push (encodeMemberStatus u.status)) u.incarnation) (pushGossipUpdate b u) := by
+      unfold pushGossipUpdate
+      exact PrefixOf_push _ _
+    exact PrefixOf_trans h1 hpre
+  have htx : bytes.get! (b.size + 9) = u.transmissions := by
+    rw [hpre.2 (b.size + 9) (by rw [hsz_push]; omega)]
+    unfold pushGossipUpdate
+    have hlt : b.size + 9 = (pushUInt32BE ((pushUInt32BE b u.id).push (encodeMemberStatus u.status)) u.incarnation).size := by
+      simp [ByteArray.size_push, pushUInt32BE_size]
+    rw [hlt]
+    exact byteArray_get!_push_eq _ _
+  rw [hid, hst, decodeMemberStatus_encodeMemberStatus, hinc, htx]
+
+theorem decodeGossipUpdates_loop_eq (updates : Array GossipUpdate) (count i : Nat)
+    (b bytes : ByteArray) (accOut : Array GossipUpdate)
+    (hi : i ≤ count) (hcnt : count ≤ updates.size)
+    (hacc : accOut.toList = updates.toList.take i)
+    (hpre : PrefixOf (pushGossipUpdates.loop updates count i b) bytes) :
+    decodeGossipUpdates.loop bytes count i b.size accOut =
+      some (updates.extract 0 count) := by
+  induction i, b using pushGossipUpdates.loop.induct updates count generalizing accOut with
+  | case1 i b hlt u ih =>
+    rw [decodeGossipUpdates.loop.eq_def]
+    simp only [hlt, ↓reduceDIte]
+    have hlt' : i < count := hlt
+    have hle : i < updates.size := Nat.lt_of_lt_of_le hlt' hcnt
+    have hu : u = updates[i] := by simp only [u, hle, ↓reduceDIte]
+    have hpre_next : PrefixOf (pushGossipUpdates.loop updates count (i + 1) (pushGossipUpdate b u)) bytes := by
+      rw [pushGossipUpdates.loop.eq_def] at hpre
+      simpa [hlt] using hpre
+    have hpre_step : PrefixOf (pushGossipUpdate b u) bytes :=
+      PrefixOf_trans (PrefixOf_pushGossipUpdates_loop updates count (i + 1) (pushGossipUpdate b u)) hpre_next
+    rw [readGossipUpdate_pushGossipUpdate b bytes u hpre_step]
+    have hsz : (pushGossipUpdate b u).size = b.size + 10 := pushGossipUpdate_size b u
+    rw [← hsz]
+    refine ih (accOut.push u) (by omega) ?_ hpre_next
+    rw [Array.toList_push, hacc, hu, List.take_add_one]
+    simp [hle]
+  | case2 i b hge =>
+    rw [decodeGossipUpdates.loop.eq_def]
+    simp only [hge, ↓reduceDIte]
+    have hieq : i = count := by omega
+    subst hieq
+    congr 1
+    apply Array.ext'
+    rw [hacc, Array.toList_extract]
+    simp
+
+theorem decodeGossipUpdates_pushGossipUpdates (updates : Array GossipUpdate) (count : Nat)
+    (b bytes : ByteArray) (hcnt : count ≤ updates.size)
+    (hpre : PrefixOf (pushGossipUpdates b updates count) bytes) :
+    decodeGossipUpdates bytes b.size count = some (updates.extract 0 count) := by
+  unfold decodeGossipUpdates
+  exact decodeGossipUpdates_loop_eq updates count 0 b bytes #[] (Nat.zero_le _) hcnt (by simp) hpre
+
+/-- **Universal Wire Round-Trip Bijection Theorem**:
+    For EVERY well-formed `Message` (up to 255 piggybacked gossip updates) with
+    arbitrary 32-bit `NodeId`s, sequence numbers, incarnations, and statuses,
+    encoding followed by decoding recovers the exact original message. -/
+theorem decodeMessage_encodeMessage_wellFormed (msg : Message) (hwf : WellFormedMessage msg) :
+    decodeMessage (encodeMessage msg) = some msg := by
+  cases msg with
+  | ping src seq updates =>
+    have hcnt : updates.size ≤ 255 := hwf
+    have hnot : ¬ (updates.size > 255) := by omega
+    have hsz : (encodeMessage (.ping src seq updates)).size = 10 + updates.size * 10 :=
+      encodeMessage_size_ping_wellFormed src seq updates hcnt
+    let b0 := ByteArray.empty.push 1
+    let b1 := pushUInt32BE b0 src
+    let b2 := pushUInt32BE b1 seq
+    let b3 := b2.push (if updates.size > 255 then 255 else updates.size).toUInt8
+    have hb3_sz : b3.size = 10 := by simp [b3, b2, b1, b0, ByteArray.size_push, pushUInt32BE_size]
+    have henc_eq : encodeMessage (.ping src seq updates) = pushGossipUpdates b3 updates updates.size := by
+      unfold encodeMessage; simp [hnot, b3, b2, b1, b0]
+    have hpre_b3 : PrefixOf b3 (encodeMessage (.ping src seq updates)) := by
+      rw [henc_eq]; exact PrefixOf_pushGossipUpdates _ _ _
+    have htag : (encodeMessage (.ping src seq updates)).get! 0 = 1 := by
+      rw [PrefixOf_get! hpre_b3 (by rw [hb3_sz]; omega)]
+      have hp0 : PrefixOf b0 b3 := PrefixOf_trans (PrefixOf_pushUInt32BE _ _) <|
+        PrefixOf_trans (PrefixOf_pushUInt32BE _ _) (PrefixOf_push _ _)
+      rw [PrefixOf_get! hp0 (by simp [b0, ByteArray.size_push])]
+      exact byteArray_get!_push_eq ByteArray.empty 1
+    have hcount_byte : (encodeMessage (.ping src seq updates)).get! 9 = updates.size.toUInt8 := by
+      rw [PrefixOf_get! hpre_b3 (by rw [hb3_sz]; omega)]
+      have h9 : (9 : Nat) = b2.size := by simp [b2, b1, b0, ByteArray.size_push, pushUInt32BE_size]
+      rw [h9]
+      simp [b3, hnot, byteArray_get!_push_eq]
+    have hcount_nat : (updates.size.toUInt8).toNat = updates.size := by
+      simp only [Nat.toUInt8, UInt8.toNat]; exact Nat.mod_eq_of_lt (by omega)
+    have hsrc : readUInt32BE (encodeMessage (.ping src seq updates)) 1 = some src := by
+      have h1 : (1 : Nat) = b0.size := by simp [b0, ByteArray.size_push]
+      rw [h1]
+      exact readUInt32BE_pushUInt32BE b0 _ src (PrefixOf_trans (PrefixOf_trans (PrefixOf_pushUInt32BE _ _) (PrefixOf_push _ _)) hpre_b3)
+    have hseq : readUInt32BE (encodeMessage (.ping src seq updates)) 5 = some seq := by
+      have h5 : (5 : Nat) = b1.size := by simp [b1, b0, ByteArray.size_push, pushUInt32BE_size]
+      rw [h5]
+      exact readUInt32BE_pushUInt32BE b1 _ seq (PrefixOf_trans (PrefixOf_push _ _) hpre_b3)
+    have hupds : decodeGossipUpdates (encodeMessage (.ping src seq updates)) 10 updates.size = some updates := by
+      rw [← hb3_sz]
+      have hdec := decodeGossipUpdates_pushGossipUpdates updates updates.size b3 (encodeMessage (.ping src seq updates)) (Nat.le_refl _) (by rw [← henc_eq]; exact PrefixOf_refl _)
+      simpa using hdec
+    unfold decodeMessage
+    rw [hsz]
+    split
+    · omega
+    · simp only [htag, hcount_byte, hcount_nat, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+      rw [hsrc, hseq, hupds]
+      simp [Bind.bind, Option.bind]
+  | ack src seq updates =>
+    have hcnt : updates.size ≤ 255 := hwf
+    have hnot : ¬ (updates.size > 255) := by omega
+    have hsz : (encodeMessage (.ack src seq updates)).size = 10 + updates.size * 10 :=
+      encodeMessage_size_ack_wellFormed src seq updates hcnt
+    let b0 := ByteArray.empty.push 2
+    let b1 := pushUInt32BE b0 src
+    let b2 := pushUInt32BE b1 seq
+    let b3 := b2.push (if updates.size > 255 then 255 else updates.size).toUInt8
+    have hb3_sz : b3.size = 10 := by simp [b3, b2, b1, b0, ByteArray.size_push, pushUInt32BE_size]
+    have henc_eq : encodeMessage (.ack src seq updates) = pushGossipUpdates b3 updates updates.size := by
+      unfold encodeMessage; simp [hnot, b3, b2, b1, b0]
+    have hpre_b3 : PrefixOf b3 (encodeMessage (.ack src seq updates)) := by
+      rw [henc_eq]; exact PrefixOf_pushGossipUpdates _ _ _
+    have htag : (encodeMessage (.ack src seq updates)).get! 0 = 2 := by
+      rw [PrefixOf_get! hpre_b3 (by rw [hb3_sz]; omega)]
+      have hp0 : PrefixOf b0 b3 := PrefixOf_trans (PrefixOf_pushUInt32BE _ _) <|
+        PrefixOf_trans (PrefixOf_pushUInt32BE _ _) (PrefixOf_push _ _)
+      rw [PrefixOf_get! hp0 (by simp [b0, ByteArray.size_push])]
+      exact byteArray_get!_push_eq ByteArray.empty 2
+    have hcount_byte : (encodeMessage (.ack src seq updates)).get! 9 = updates.size.toUInt8 := by
+      rw [PrefixOf_get! hpre_b3 (by rw [hb3_sz]; omega)]
+      have h9 : (9 : Nat) = b2.size := by simp [b2, b1, b0, ByteArray.size_push, pushUInt32BE_size]
+      rw [h9]
+      simp [b3, hnot, byteArray_get!_push_eq]
+    have hcount_nat : (updates.size.toUInt8).toNat = updates.size := by
+      simp only [Nat.toUInt8, UInt8.toNat]; exact Nat.mod_eq_of_lt (by omega)
+    have hsrc : readUInt32BE (encodeMessage (.ack src seq updates)) 1 = some src := by
+      have h1 : (1 : Nat) = b0.size := by simp [b0, ByteArray.size_push]
+      rw [h1]
+      exact readUInt32BE_pushUInt32BE b0 _ src (PrefixOf_trans (PrefixOf_trans (PrefixOf_pushUInt32BE _ _) (PrefixOf_push _ _)) hpre_b3)
+    have hseq : readUInt32BE (encodeMessage (.ack src seq updates)) 5 = some seq := by
+      have h5 : (5 : Nat) = b1.size := by simp [b1, b0, ByteArray.size_push, pushUInt32BE_size]
+      rw [h5]
+      exact readUInt32BE_pushUInt32BE b1 _ seq (PrefixOf_trans (PrefixOf_push _ _) hpre_b3)
+    have hupds : decodeGossipUpdates (encodeMessage (.ack src seq updates)) 10 updates.size = some updates := by
+      rw [← hb3_sz]
+      have hdec := decodeGossipUpdates_pushGossipUpdates updates updates.size b3 (encodeMessage (.ack src seq updates)) (Nat.le_refl _) (by rw [← henc_eq]; exact PrefixOf_refl _)
+      simpa using hdec
+    unfold decodeMessage
+    rw [hsz]
+    split
+    · omega
+    · simp only [htag, hcount_byte, hcount_nat, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+      rw [hsrc, hseq, hupds]
+      simp [Bind.bind, Option.bind]
+  | pingReq src target seq updates =>
+    have hcnt : updates.size ≤ 255 := hwf
+    have hnot : ¬ (updates.size > 255) := by omega
+    have hsz : (encodeMessage (.pingReq src target seq updates)).size = 14 + updates.size * 10 :=
+      encodeMessage_size_pingReq_wellFormed src target seq updates hcnt
+    let b0 := ByteArray.empty.push 3
+    let b1 := pushUInt32BE b0 src
+    let b2 := pushUInt32BE b1 seq
+    let b3 := pushUInt32BE b2 target
+    let b4 := b3.push (if updates.size > 255 then 255 else updates.size).toUInt8
+    have hb4_sz : b4.size = 14 := by simp [b4, b3, b2, b1, b0, ByteArray.size_push, pushUInt32BE_size]
+    have henc_eq : encodeMessage (.pingReq src target seq updates) = pushGossipUpdates b4 updates updates.size := by
+      unfold encodeMessage; simp [hnot, b4, b3, b2, b1, b0]
+    have hpre_b4 : PrefixOf b4 (encodeMessage (.pingReq src target seq updates)) := by
+      rw [henc_eq]; exact PrefixOf_pushGossipUpdates _ _ _
+    have htag : (encodeMessage (.pingReq src target seq updates)).get! 0 = 3 := by
+      rw [PrefixOf_get! hpre_b4 (by rw [hb4_sz]; omega)]
+      have hp0 : PrefixOf b0 b4 := PrefixOf_trans (PrefixOf_pushUInt32BE _ _) <|
+        PrefixOf_trans (PrefixOf_pushUInt32BE _ _) <|
+        PrefixOf_trans (PrefixOf_pushUInt32BE _ _) (PrefixOf_push _ _)
+      rw [PrefixOf_get! hp0 (by simp [b0, ByteArray.size_push])]
+      exact byteArray_get!_push_eq ByteArray.empty 3
+    have hcount_byte : (encodeMessage (.pingReq src target seq updates)).get! 13 = updates.size.toUInt8 := by
+      rw [PrefixOf_get! hpre_b4 (by rw [hb4_sz]; omega)]
+      have h13 : (13 : Nat) = b3.size := by simp [b3, b2, b1, b0, ByteArray.size_push, pushUInt32BE_size]
+      rw [h13]
+      simp [b4, hnot, byteArray_get!_push_eq]
+    have hcount_nat : (updates.size.toUInt8).toNat = updates.size := by
+      simp only [Nat.toUInt8, UInt8.toNat]; exact Nat.mod_eq_of_lt (by omega)
+    have hsrc : readUInt32BE (encodeMessage (.pingReq src target seq updates)) 1 = some src := by
+      have h1 : (1 : Nat) = b0.size := by simp [b0, ByteArray.size_push]
+      rw [h1]
+      exact readUInt32BE_pushUInt32BE b0 _ src (PrefixOf_trans (PrefixOf_trans (PrefixOf_pushUInt32BE _ _) (PrefixOf_trans (PrefixOf_pushUInt32BE _ _) (PrefixOf_push _ _))) hpre_b4)
+    have hseq : readUInt32BE (encodeMessage (.pingReq src target seq updates)) 5 = some seq := by
+      have h5 : (5 : Nat) = b1.size := by simp [b1, b0, ByteArray.size_push, pushUInt32BE_size]
+      rw [h5]
+      exact readUInt32BE_pushUInt32BE b1 _ seq (PrefixOf_trans (PrefixOf_trans (PrefixOf_pushUInt32BE _ _) (PrefixOf_push _ _)) hpre_b4)
+    have htarget : readUInt32BE (encodeMessage (.pingReq src target seq updates)) 9 = some target := by
+      have h9 : (9 : Nat) = b2.size := by simp [b2, b1, b0, ByteArray.size_push, pushUInt32BE_size]
+      rw [h9]
+      exact readUInt32BE_pushUInt32BE b2 _ target (PrefixOf_trans (PrefixOf_push _ _) hpre_b4)
+    have hupds : decodeGossipUpdates (encodeMessage (.pingReq src target seq updates)) 14 updates.size = some updates := by
+      rw [← hb4_sz]
+      have hdec := decodeGossipUpdates_pushGossipUpdates updates updates.size b4 (encodeMessage (.pingReq src target seq updates)) (Nat.le_refl _) (by rw [← henc_eq]; exact PrefixOf_refl _)
+      simpa using hdec
+    unfold decodeMessage
+    rw [hsz]
+    split
+    · omega
+    · simp only [htag, hcount_byte, hcount_nat, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+      split
+      · omega
+      · rw [hsrc, hseq, htarget, hupds]
+        simp [Bind.bind, Option.bind]
+
+theorem wellFormedMessage_satisfies_roundtrip (msg : Message) (hwf : WellFormedMessage msg) :
+    SatisfiesWireRoundTrip msg :=
+  decodeMessage_encodeMessage_wellFormed msg hwf
+
 end SwimProofs

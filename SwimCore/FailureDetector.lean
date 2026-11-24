@@ -20,6 +20,7 @@ structure NodeState where
   nextProbeAt        : Timestamp
   probeIndex         : Nat
   pendingAckDeadline : Option (NodeId × UInt32 × Timestamp × Bool)
+  pendingRelays      : Array (UInt32 × PeerAddr × UInt32)
 deriving Inhabited, Repr
 
 /-- Initialize a SWIM node with cluster peers. -/
@@ -43,10 +44,11 @@ def initNode (id : NodeId) (addr : PeerAddr) (seed : UInt64) (peers : Array (Nod
     seqCounter := 0,
     protocolPeriodMs := 1000,
     ackTimeoutMs := 200,
-    suspectTimeoutMs := 1000,
+    suspectTimeoutMs := 2500,
     nextProbeAt := 0,
     probeIndex := 0,
-    pendingAckDeadline := none
+    pendingAckDeadline := none,
+    pendingRelays := #[]
   }
 
 /-- Add a peer to the membership list if not self and not already present. -/
@@ -98,63 +100,97 @@ def markSuspect (st : NodeState) (targetId : NodeId) (now : Timestamp) : NodeSta
   | none =>
     (st, #[])
 
+/-- Tail-recursive helper scanning membership entries `[i, curMembers.size)` to promote expired suspects.
+    Avoids heap-allocating a `Range` object on every tick and enables Perceus in-place array updates. -/
+def checkSuspectTimeoutsLoop (now : Timestamp) (i : Nat)
+    (curMembers : Array MemberEntry) (curBuf : Array GossipUpdate) (acts : Array Action) :
+    Array MemberEntry × Array GossipUpdate × Array Action :=
+  if h : i < curMembers.size then
+    let m := curMembers[i]
+    if m.status == MemberStatus.suspect && now >= m.suspectDeadline then
+      let m' := { m with status := MemberStatus.dead, suspectDeadline := 0 }
+      let nextMembers := curMembers.set i m' h
+      let nextBuf := addOrUpdate curBuf m.id MemberStatus.dead m.incarnation
+      let nextActs := acts.push (Action.emitMembershipChange m.id MemberStatus.dead m.incarnation)
+      checkSuspectTimeoutsLoop now (i + 1) nextMembers nextBuf nextActs
+    else
+      checkSuspectTimeoutsLoop now (i + 1) curMembers curBuf acts
+  else
+    (curMembers, curBuf, acts)
+termination_by curMembers.size - i
+decreasing_by
+  all_goals (try simp only [Array.size_set]); omega
+
 /-- Scan membership array and promote expired suspect nodes to dead. -/
 def checkSuspectTimeouts (st : NodeState) (now : Timestamp) : NodeState × Array Action :=
-  Id.run do
-    let mut curMembers := st.members
-    let mut curBuf := st.disseminationBuf
-    let mut acts : Array Action := #[]
-    for i in [0:curMembers.size] do
-      let m := curMembers[i]!
-      if m.status == MemberStatus.suspect && now >= m.suspectDeadline then
-        let m' := { m with status := MemberStatus.dead, suspectDeadline := 0 }
-        curMembers := curMembers.set! i m'
-        curBuf := addOrUpdate curBuf m.id MemberStatus.dead m.incarnation
-        acts := acts.push (Action.emitMembershipChange m.id MemberStatus.dead m.incarnation)
-    let nextSt := { st with members := curMembers, disseminationBuf := curBuf }
-    (nextSt, acts)
+  let members := st.members
+  let buf := st.disseminationBuf
+  let baseSt := { st with members := #[], disseminationBuf := #[] }
+  let (nextMembers, nextBuf, acts) := checkSuspectTimeoutsLoop now 0 members buf #[]
+  ({ baseSt with members := nextMembers, disseminationBuf := nextBuf }, acts)
+
+/-- Merge a single incoming gossip update into `NodeState` (pure step for `mergeGossipUpdates`). -/
+def mergeOneGossipUpdate (now : Timestamp) (acc : NodeState × Array Action) (u : GossipUpdate) :
+    NodeState × Array Action :=
+  let curSt := acc.1
+  let acts := acc.2
+  if u.id == curSt.selfId then
+    -- Update concerning local node: refute if suspected or marked dead with incarnation >= local
+    if (u.status == MemberStatus.suspect || u.status == MemberStatus.dead) && u.incarnation >= curSt.incarnation then
+      -- Saturating increment prevents UInt32 wrap-around violating incarnation monotonicity
+      let newInc := if u.incarnation < 0xFFFFFFFF then u.incarnation + 1 else u.incarnation
+      let newBuf := addOrUpdate curSt.disseminationBuf curSt.selfId MemberStatus.alive newInc
+      let nextSt := { curSt with
+        incarnation := newInc,
+        disseminationBuf := newBuf
+      }
+      (nextSt, acts.push (Action.emitMembershipChange nextSt.selfId MemberStatus.alive newInc))
+    else
+      (curSt, acts)
+  else
+    -- Update concerning a peer
+    match curSt.members.findIdx? (fun m => m.id == u.id) with
+    | some idx =>
+      let cur := curSt.members[idx]!
+      if shouldOverride u.incarnation u.status cur.incarnation cur.status then
+        let newDeadline := if u.status == MemberStatus.suspect then now + curSt.suspectTimeoutMs else 0
+        let m' := { cur with
+          status := u.status,
+          incarnation := u.incarnation,
+          suspectDeadline := newDeadline
+        }
+        let members := curSt.members
+        let buf := curSt.disseminationBuf
+        let baseSt := { curSt with members := #[], disseminationBuf := #[] }
+        let newMembers := members.set! idx m'
+        let newBuf := addOrUpdate buf u.id u.status u.incarnation
+        let nextSt := { baseSt with
+          members := newMembers,
+          disseminationBuf := newBuf
+        }
+        (nextSt, acts.push (Action.emitMembershipChange u.id u.status u.incarnation))
+      else
+        (curSt, acts)
+    | none =>
+      -- Node not in membership list; record update in dissemination buffer
+      let newBuf := addOrUpdate curSt.disseminationBuf u.id u.status u.incarnation
+      ({ curSt with disseminationBuf := newBuf }, acts)
 
 /-- Merge incoming piggybacked gossip updates into local state.
     Refutes suspicion if self was suspected with incarnation >= local incarnation. -/
 def mergeGossipUpdates (st : NodeState) (updates : Array GossipUpdate) (now : Timestamp) : NodeState × Array Action :=
-  Id.run do
-    let mut curSt := st
-    let mut acts : Array Action := #[]
-    for u in updates do
-      if u.id == curSt.selfId then
-        -- Update concerning local node: refute if suspected or marked dead with incarnation >= local
-        if (u.status == MemberStatus.suspect || u.status == MemberStatus.dead) && u.incarnation >= curSt.incarnation then
-          let newInc := u.incarnation + 1
-          let newBuf := addOrUpdate curSt.disseminationBuf curSt.selfId MemberStatus.alive newInc
-          curSt := { curSt with
-            incarnation := newInc,
-            disseminationBuf := newBuf
-          }
-          acts := acts.push (Action.emitMembershipChange curSt.selfId MemberStatus.alive newInc)
-      else
-        -- Update concerning a peer
-        match curSt.members.findIdx? (fun m => m.id == u.id) with
-        | some idx =>
-          let cur := curSt.members[idx]!
-          if shouldOverride u.incarnation u.status cur.incarnation cur.status then
-            let newDeadline := if u.status == MemberStatus.suspect then now + curSt.suspectTimeoutMs else 0
-            let m' := { cur with
-              status := u.status,
-              incarnation := u.incarnation,
-              suspectDeadline := newDeadline
-            }
-            let newMembers := curSt.members.set! idx m'
-            let newBuf := addOrUpdate curSt.disseminationBuf u.id u.status u.incarnation
-            curSt := { curSt with
-              members := newMembers,
-              disseminationBuf := newBuf
-            }
-            acts := acts.push (Action.emitMembershipChange u.id u.status u.incarnation)
-        | none =>
-          -- Node not in membership list; record update in dissemination buffer
-          let newBuf := addOrUpdate curSt.disseminationBuf u.id u.status u.incarnation
-          curSt := { curSt with disseminationBuf := newBuf }
-    (curSt, acts)
+  updates.foldl (mergeOneGossipUpdate now) (st, #[])
+
+/-- Compute the earliest monotonic timestamp (ms) at which the node needs a timer tick.
+    Used by the C runtime (`epoll`/`poll`) to avoid unnecessary wakeups. -/
+def nextWakeupAt (st : NodeState) : Timestamp :=
+  let d1 := match st.pendingAckDeadline with
+    | some (_, _, deadline, _) => deadline
+    | none => st.nextProbeAt
+  st.members.foldl (fun acc m =>
+    if m.status == MemberStatus.suspect && m.suspectDeadline > 0 then
+      min acc m.suspectDeadline
+    else acc) d1
 
 /-- Step transition handling periodic timer tick. -/
 def stepTick (st : NodeState) (now : Timestamp) : NodeState × Array Action :=
@@ -261,17 +297,39 @@ def stepRecvPacket (st : NodeState) (src : PeerAddr) (payload : ByteArray) (now 
         | some targetMember =>
           let maxTx := calculateMaxTransmissions 3 curSt.members.size
           let (piggyUpdates, newBuf) := drainForPacket curSt.disseminationBuf 6 maxTx
-          let forwardPing := Message.ping reqSrc seq piggyUpdates
+          let relaySeq := curSt.seqCounter
+          let reqAddr := match curSt.members.find? (fun m => m.id == reqSrc) with
+            | some rm => rm.addr
+            | none    => src
+          let forwardPing := Message.ping curSt.selfId relaySeq piggyUpdates
           let pingBytes := encodeMessage forwardPing
           acts := acts.push (Action.sendPacket targetMember.addr pingBytes)
-          curSt := { curSt with disseminationBuf := newBuf }
+          let baseRelays := if curSt.pendingRelays.size >= 32 then
+              curSt.pendingRelays.extract 1 curSt.pendingRelays.size
+            else curSt.pendingRelays
+          let nextRelays := baseRelays.push (relaySeq, reqAddr, seq)
+          curSt := { curSt with
+            disseminationBuf := newBuf,
+            seqCounter := relaySeq + 1,
+            pendingRelays := nextRelays
+          }
         | none => ()
 
-      | .ack _ seq _ =>
+      | .ack ackSrc seq _ =>
         match curSt.pendingAckDeadline with
         | some (_, pendingSeq, _, _) =>
           if pendingSeq == seq then
             curSt := { curSt with pendingAckDeadline := none }
+        | none => ()
+        match curSt.pendingRelays.findIdx? (fun (relaySeq, _, _) => relaySeq == seq) with
+        | some idx =>
+          let (_, reqAddr, origSeq) := curSt.pendingRelays[idx]!
+          let nextRelays := curSt.pendingRelays.eraseIdx! idx
+          let maxTx := calculateMaxTransmissions 3 curSt.members.size
+          let (piggyUpdates, newBuf) := drainForPacket curSt.disseminationBuf 6 maxTx
+          let relayAck := Message.ack ackSrc origSeq piggyUpdates
+          acts := acts.push (Action.sendPacket reqAddr (encodeMessage relayAck))
+          curSt := { curSt with disseminationBuf := newBuf, pendingRelays := nextRelays }
         | none => ()
 
       return (curSt, acts)

@@ -1,23 +1,36 @@
 # SWIM-Lean: Verified SWIM Gossip Failure Detector in Lean 4
 
-A formally verified, high-performance implementation of the **SWIM (Structured Weakly-Consistent Infection-Style Process Group Membership Protocol)** Gossip Failure Detector in **Lean 4**, with:
+A formally verified, high-performance implementation of the **SWIM (Structured Weakly-Consistent Infection-Style Process Group Membership Protocol)** Gossip Failure Detector in **Lean 4**, combining:
 - Strict **Sans-IO** separation between pure deterministic protocol transitions and POSIX I/O.
-- Bounded $\mathcal{O}(\log n)$ epidemic dissemination and convergence analysis.
-- Extraction to zero-pause, in-place mutating C code via Lean 4 IR (`lean --c`).
-- POSIX UDP runtime harness (`kqueue` / `epoll`).
+- **Axiom-free Mathlib4 formalization** of Phase 1 (exponential growth from $1 \to n/2$ via Chernoff bounds and stochastic dominance) and Phase 2 (exponential tail collapse $n/2 \to n$) establishing $O(\log n)$ w.h.p. epidemic dissemination.
+- **Universal binary wire bijection** (`decodeMessage (encodeMessage msg) = some msg` for all well-formed messages) and **state-machine safety refinement** linking `SwimCore.step` directly to the join-semilattice `Dominates` monotonicity invariant.
+- Extraction to in-place mutating C99 code via Lean 4 Perceus IR (`lean --c`) with protocol-deadline-aware `poll` wakeups and deterministic simulation testing (DST).
 
 ## Architecture
 
-- **`SwimCore`**: Zero-dependency executable state machine. Pure transitions on `UInt32`, `UInt64`, `ByteArray`, and `Array`.
-- **`SwimProofs`**: Formal verification using Mathlib4 (discrete PMF Markov chains, Chernoff bounds, two-phase Pittel/Karp analysis, and simulation refinement).
-- **`c_runtime`**: C99 imperative shell hosting the Lean runtime and running the non-blocking UDP event loop.
+- **`SwimCore/`**: Zero-dependency executable state machine (`UInt32`, `UInt64`, `ByteArray`, `Array`):
+  - `Types.lean`, `Prng.lean` (`SplitMix64`), `Wire.lean` (compact big-endian binary codec), `Dissemination.lean` ($\lceil \log_2 n \rceil$-bounded gossip piggybacking), `FailureDetector.lean` (`stepTick`, `stepRecvPacket` with transitive `pendingRelays` for `pingReq`, saturating self-refutation, tail-recursive `checkSuspectTimeoutsLoop`, and `nextWakeupAt`), `Exports.lean` (`@[export]` C ABI).
+- **`SwimProofs/`**: Zero-dependency Lean 4 core safety, wire, and refinement proofs:
+  - `Safety.lean`: Join-semilattice `Dominates` relation and total/transitive ordering over `(incarnation, status)`.
+  - `WireProofs.lean`: Universal roundtrip theorem `decodeMessage_encodeMessage_wellFormed`.
+  - `Refinement.lean`: State-machine safety theorem `step_preserves_safety` proving every `Event.tick` and `Event.recvPacket` preserves `StateMonotonic`.
+  - `EpidemicModel.lean` / `Convergence.lean`: Lightweight standalone model (axiomatized `Real` for fast dependency-free CI).
+- **`SwimMathlib/`**: Isolated `Mathlib4` (`v4.36.0`) proof package importing `SwimCore`:
+  - `SwimMathlibProofs/EpidemicPMF.lean`: Exact `PMF` push-gossip Markov chain & Phase 2 convergence (`phase2_convergence_whp`), **0 axioms, 0 `sorry`s**.
+  - `SwimMathlibProofs/Phase1Growth.lean`: Coupled `Binomial(m, 1/2)` exponential MGF Chernoff bound & full $1 \to n$ Phase 1 + Phase 2 theorem (`full_epidemic_convergence_whp`), **0 axioms, 0 `sorry`s**.
+- **`SimMain.lean`**: `SplitMix64` deterministic discrete-event simulation testing (DST) suite verifying 0 false positives, crash dissemination, asymmetric indirect `pingReq` relay recovery, 10% packet loss tolerance, and empirical $O(\log n)$ scaling up to $N = 64$.
+- **`c_runtime/`**: C99 POSIX UDP harness linking `libswim_SwimCore.a` + `libleanshared` with `swim_next_wakeup_at` deadline scheduling.
 
 ## Quick Start
 
 ```bash
-# Build the Lean core & Lake targets
-lake build
+# Build SwimCore, SwimProofs, and the deterministic simulator
+lake build && lake build swim_sim
+.lake/build/bin/swim_sim
 
-# Compile C code and run the UDP failure detector node
-make -C c_runtime
+# Build the axiom-free Mathlib4 epidemic proofs (uses Mathlib cache)
+cd SwimMathlib && lake exe cache get && lake build SwimMathlibProofs && cd ..
+
+# Compile C runtime and run the local UDP smoke test
+make -C c_runtime && make -C c_runtime test
 ```
