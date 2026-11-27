@@ -43,6 +43,27 @@ def swimStepResultActions (res : NodeState × Array Action) : Array Action :=
 def swimNextWakeupAt (st : NodeState) : UInt64 :=
   nextWakeupAt st
 
+/-- Return the local node's current incarnation number (for runtime safety monitoring). -/
+@[export swim_self_incarnation]
+def swimSelfIncarnation (st : NodeState) : UInt32 :=
+  st.incarnation
+
+/-- Return the number of peer entries currently tracked in the membership table. -/
+@[export swim_members_size]
+def swimMembersSize (st : NodeState) : UInt32 :=
+  st.members.size.toUInt32
+
+/-- Return a peer's status (0 = alive, 1 = suspect, 2 = dead, 255 = unknown). -/
+@[export swim_member_status]
+def swimMemberStatus (st : NodeState) (id : UInt32) : UInt8 :=
+  match st.getMember? id with
+  | some m =>
+    match m.status with
+    | MemberStatus.alive   => 0
+    | MemberStatus.suspect => 1
+    | MemberStatus.dead    => 2
+  | none => 255
+
 /-- Get the number of actions in an `Array Action`. -/
 @[export swim_actions_size]
 def swimActionsSize (actions : Array Action) : UInt32 :=

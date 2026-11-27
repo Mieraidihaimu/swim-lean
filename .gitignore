@@ -9,3 +9,4 @@ build/
 *.dylib
 .DS_Store
 c_runtime/swim_node
+c_runtime/loadgen

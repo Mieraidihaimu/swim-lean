@@ -28,6 +28,11 @@ lean_object* swim_step_result_state(lean_object* res);
 lean_object* swim_step_result_actions(lean_object* res);
 uint64_t     swim_next_wakeup_at(lean_object* st);
 
+/* Read-only state observation helpers */
+uint32_t     swim_self_incarnation(lean_object* st);
+uint32_t     swim_members_size(lean_object* st);
+uint8_t      swim_member_status(lean_object* st, uint32_t id);
+
 /* Array Action accessors */
 uint32_t     swim_actions_size(lean_object* actions);
 lean_object* swim_actions_get(lean_object* actions, uint32_t idx);

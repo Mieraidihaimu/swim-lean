@@ -31,6 +31,15 @@ lake build && lake build swim_sim
 # Build the axiom-free Mathlib4 epidemic proofs (uses Mathlib cache)
 cd SwimMathlib && lake exe cache get && lake build SwimMathlibProofs && cd ..
 
-# Compile C runtime and run the local UDP smoke test
+# Compile C runtime, run the smoke test, and run the load-generator experiment
 make -C c_runtime && make -C c_runtime test
+make -C c_runtime loadtest
 ```
+
+## Proof -> Extracted C -> Load-Generator Experiment
+
+[`c_runtime/loadgen.c`](c_runtime/loadgen.c) and [`c_runtime/run_experiment.sh`](c_runtime/run_experiment.sh) stress-test the compiled Lean-4 Perceus C artifact (`libswim_SwimCore.a` + `swim_node`) across three automated stages:
+
+1. **Direct Perceus FFI Stress (`--mode ffi`)**: Executes 200,000 mixed state transitions (70% valid SWIM packets with piggybacked gossip & self-suspicion refutation, 25% malformed/fuzzed wire payloads, 5% timer ticks) on a 100-peer node while runtime-checking `Refinement.step_preserves_safety` invariants (`members_size` constant, `incarnation` monotonic) on every step (~1.81M transitions/sec, `p99 = 2us`, `max = 19us`).
+2. **Live UDP Wire Load (`--mode udp`)**: Drives 20,000 pipelined UDP `Ping -> Ack` roundtrips plus 2,000 malformed UDP frames against a live `swim_node` process (~116.6k roundtrips/sec, `p50 = 77us`, `p99 = 236us`, 0.000% loss, `swim_node` RSS unchanged at 10,768 KiB).
+3. **Cluster Churn Under Concurrent Load (`--mode storm`)**: Blasts a live 5-node `swim_node` UDP cluster with ~4,000 pps + 10% malformed fuzz packets while injecting `SIGKILL` on Node 5, verifying all 4 surviving processes converge on `Node 5 -> SUSPECT -> DEAD`.
